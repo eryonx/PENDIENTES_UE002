@@ -10,6 +10,16 @@ let sendersMap = {};
 let duplicates = [];
 let observations = {};
 
+// Historical Senders State
+let historicalRecords = [];
+let isHistoricalLoading = false;
+let currentSenderTab = 'current';
+let historicalFilteredRecords = [];
+let historicalCurrentPage = 1;
+let historicalPageSize = 20;
+let historicalSortCol = 'Fecha de Creación de Tramite';
+let historicalSortDir = 'desc';
+
 // Active state for selected elements
 let selectedSenderId = null;
 
@@ -17,6 +27,7 @@ let selectedSenderId = null;
 let senderFilterOrigin = 'ALL';
 let senderFilterType = 'ALL';
 let senderSortCriterion = 'name-asc';
+let senderFilteredList = [];
 
 // --- Tab-specific Pagination & Sort States ---
 
@@ -95,7 +106,11 @@ function saveObservations() {
   filterExplorerData();
   renderExplorer();
   if (selectedSenderId) {
-    loadSenderDetails(selectedSenderId);
+    if (selectedSenderId === 'ALL_FILTERED_SENDERS') {
+      loadFilteredSendersGroupDetails();
+    } else {
+      loadSenderDetails(selectedSenderId);
+    }
   }
   filterDuplicatesList();
   renderDuplicates();
@@ -183,6 +198,17 @@ function setupEventListeners() {
   // Theme toggle
   themeToggleBtn.addEventListener('click', toggleTheme);
 
+  // Sidebar toggle
+  const toggleSidebarBtn = document.getElementById('toggle-sidebar-btn');
+  if (toggleSidebarBtn) {
+    toggleSidebarBtn.addEventListener('click', () => {
+      const dashboardGrid = document.getElementById('app-content');
+      if (dashboardGrid) {
+        dashboardGrid.classList.toggle('sidebar-collapsed');
+      }
+    });
+  }
+
   // Clear Database button
   clearDbBtn.addEventListener('click', () => {
     if (confirm('¿Está seguro de que desea limpiar la base de datos? Esto restablecerá la base de datos pero mantendrá las observaciones anotadas.')) {
@@ -259,6 +285,12 @@ function setupEventListeners() {
 
   document.getElementById('search-sender').addEventListener('input', () => {
     filterAndRenderSendersList();
+    if (selectedSenderId === 'ALL_FILTERED_SENDERS') {
+      loadFilteredSendersGroupDetails();
+    }
+    if (currentSenderTab === 'historical' && historicalRecords.length > 0) {
+      searchHistoricalMatches();
+    }
   });
 
   // --- Explorer Sidebar Filter Event Listeners ---
@@ -343,6 +375,10 @@ function setupEventListeners() {
   document.getElementById('export-json-btn').addEventListener('click', exportObservationsAsJSON);
   document.getElementById('export-csv-btn').addEventListener('click', exportObservationsAsCSV);
   document.getElementById('import-obs-file').addEventListener('change', importObservationsJSON);
+  document.getElementById('exp-export-btn').addEventListener('click', exportFilteredRecordsAsCSV);
+  document.getElementById('dup-export-btn').addEventListener('click', exportDuplicatesAsCSV);
+  document.getElementById('obs-export-btn').addEventListener('click', exportFilteredObservationsAsCSV);
+  document.getElementById('senders-export-btn').addEventListener('click', exportFilteredSendersAsCSV);
 
   // --- Table Headers Interactive Sorting listeners ---
   // 1. Explorer Table
@@ -442,8 +478,6 @@ function switchTab(tabId) {
     document.getElementById('sidebar-observations-controls').classList.add('active');
     filterObservationsList();
     renderObservations();
-  } else if (tabId === 'tab-git-guide') {
-    document.getElementById('sidebar-git-controls').classList.add('active');
   }
 }
 
@@ -524,7 +558,8 @@ function processRawData(data) {
       'Remitente': cleanName,
       'Origen': origin,
       'Tipo de Persona': personType,
-      'Último Documento': ultimoDoc
+      'Último Documento': ultimoDoc,
+      _original: record
     };
   });
 
@@ -997,6 +1032,18 @@ function filterAndRenderSendersList() {
     });
   }
 
+  senderFilteredList = filteredSenders;
+
+  const indicator = document.getElementById('senders-count-indicator');
+  if (indicator) {
+    const totalFilteredDocs = filteredSenders.reduce((sum, s) => sum + s.documentCount, 0);
+    if (query || senderFilterOrigin !== 'ALL' || senderFilterType !== 'ALL') {
+      indicator.innerHTML = `Filtros: <strong style="color:var(--accent);">${filteredSenders.length}</strong> remitentes (${totalFilteredDocs} trámites)`;
+    } else {
+      indicator.innerHTML = `Total: <strong>${filteredSenders.length}</strong> remitentes (${totalFilteredDocs} trámites)`;
+    }
+  }
+
   const container = document.getElementById('senders-list-container');
   if (filteredSenders.length === 0) {
     container.innerHTML = `
@@ -1008,6 +1055,20 @@ function filterAndRenderSendersList() {
   }
 
   let html = '';
+  if (filteredSenders.length > 1) {
+    const totalFilteredDocs = filteredSenders.reduce((sum, s) => sum + s.documentCount, 0);
+    const isSelected = selectedSenderId === 'ALL_FILTERED_SENDERS' ? 'selected' : '';
+    html += `
+      <div class="sender-item virtual-all-item ${isSelected}" onclick="selectFilteredSendersGroup()" style="border: 1px dashed var(--accent); background: var(--bg-secondary);">
+        <div class="sender-name" style="font-weight:700; color:var(--accent);">📁 Ver todos los remitentes</div>
+        <div class="sender-meta">
+          <span>${filteredSenders.length} remitentes</span>
+          <span style="font-weight:700; color:var(--text-primary);">${totalFilteredDocs} trámites</span>
+        </div>
+      </div>
+    `;
+  }
+
   filteredSenders.forEach(s => {
     const isSelected = selectedSenderId === s.name ? 'selected' : '';
     html += `
@@ -1065,6 +1126,172 @@ function loadSenderDetails(senderName) {
   renderSenderHistory();
 }
 
+function selectFilteredSendersGroup() {
+  selectedSenderId = 'ALL_FILTERED_SENDERS';
+  
+  // Highlight in sidebar list
+  const items = document.querySelectorAll('.sender-item');
+  items.forEach(item => {
+    if (item.classList.contains('virtual-all-item')) {
+      item.classList.add('selected');
+    } else {
+      item.classList.remove('selected');
+    }
+  });
+
+  loadFilteredSendersGroupDetails();
+}
+
+function loadFilteredSendersGroupDetails() {
+  const emptyState = document.getElementById('sender-empty-state');
+  const detailsContainer = document.getElementById('sender-details-container');
+  
+  emptyState.style.display = 'none';
+  detailsContainer.style.display = 'block';
+
+  // Combine documents from all filtered senders
+  selectedSenderRecords = [];
+  senderFilteredList.forEach(s => {
+    selectedSenderRecords = selectedSenderRecords.concat(s.documents);
+  });
+  
+  // Reset sorting and page
+  senderHistoryCurrentPage = 1;
+  senderHistorySortCol = 'Fecha de Creación de Tramite';
+  senderHistorySortDir = 'desc';
+
+  renderSenderDetailsCardForGroup();
+  sortSenderHistory();
+  renderSenderHistory();
+}
+
+function renderSenderDetailsCardForGroup() {
+  const container = document.getElementById('sender-details-container');
+  const totalTrámites = selectedSenderRecords.length;
+  const obsCount = selectedSenderRecords.filter(r => !!observations[r.CUT]).length;
+
+  container.innerHTML = `
+    <!-- Top Details KPI panel -->
+    <div style="display:flex; justify-content:space-between; align-items:start; flex-wrap:wrap; gap:1rem; margin-bottom:1.25rem; padding-bottom:1rem; border-bottom:1px solid var(--border);">
+      <div>
+        <h2 style="font-size:1.35rem; font-weight:800; color:var(--text-primary);">Todos los Remitentes Filtrados</h2>
+        <div style="display:flex; gap:0.35rem; margin-top:0.25rem;">
+          <span class="badge-tag" style="font-size:0.75rem; padding:0.2rem 0.5rem; background:var(--accent-light); color:var(--accent);">${senderFilteredList.length} remitentes</span>
+        </div>
+      </div>
+      
+      <!-- Sub KPIs -->
+      <div style="display:flex; gap:0.5rem;">
+        <div class="stat-item" style="min-width:90px;">
+          <div class="stat-item-val">${totalTrámites}</div>
+          <div class="stat-item-label">Documentos</div>
+        </div>
+        <div class="stat-item" style="min-width:90px;">
+          <div class="stat-item-val" style="color:var(--warning);">${obsCount}</div>
+          <div class="stat-item-label">Con Obs.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Sender Detail Sub-Tabs -->
+    <div class="sender-tabs">
+      <button class="sender-tab-btn ${currentSenderTab === 'current' ? 'active' : ''}" id="btn-sender-tab-current" onclick="switchSenderTab('current')">
+        Base de Datos Actual
+      </button>
+      <button class="sender-tab-btn ${currentSenderTab === 'historical' ? 'active' : ''}" id="btn-sender-tab-historical" onclick="switchSenderTab('historical')">
+        Historial 2024-2026
+      </button>
+    </div>
+
+    <!-- Panel 1: Current Database Senders -->
+    <div id="sender-current-panel" style="display: ${currentSenderTab === 'current' ? 'block' : 'none'};">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem; flex-wrap:wrap; gap:0.5rem;">
+        <h3 style="font-size:0.95rem; font-weight:700; color:var(--text-primary); margin:0;">Historial de Documentos Presentados</h3>
+        <button class="btn-success" id="sender-export-btn" onclick="exportSenderHistoryAsCSV()" style="padding:0.35rem 0.75rem; font-size:0.7rem;" title="Exportar historial del remitente a CSV con sus observaciones">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:12px; height:12px;">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+            <polyline points="7 10 12 15 17 10"></polyline>
+            <line x1="12" y1="15" x2="12" y2="3"></line>
+          </svg>
+          Exportar Historial
+        </button>
+      </div>
+      
+      <div class="table-container">
+        <table class="data-table" id="sender-history-table">
+          <thead>
+            <tr>
+              <th class="sortable ${senderHistorySortCol === 'index' ? (senderHistorySortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-history-col="index">N°</th>
+              <th class="sortable ${senderHistorySortCol === 'CUT' ? (senderHistorySortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-history-col="CUT">CUT</th>
+              <th class="sortable ${senderHistorySortCol === 'count' ? (senderHistorySortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-history-col="count">Registros</th>
+              <th class="sortable ${senderHistorySortCol === 'Fecha de Creación de Tramite' ? (senderHistorySortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-history-col="Fecha de Creación de Tramite">Fecha de Creación de Trámite</th>
+              <th class="sortable ${senderHistorySortCol === 'Remitente' ? (senderHistorySortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-history-col="Remitente">Remitente</th>
+              <th class="sortable ${senderHistorySortCol === 'Documento Origen' ? (senderHistorySortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-history-col="Documento Origen">Documento Origen</th>
+              <th class="sortable ${senderHistorySortCol === 'Asunto Origen' ? (senderHistorySortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-history-col="Asunto Origen">Asunto</th>
+              <th class="sortable ${senderHistorySortCol === 'Último Documento' ? (senderHistorySortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-history-col="Último Documento">Último Documento</th>
+              <th>Revisión</th>
+              <th style="text-align:right;">Acción</th>
+            </tr>
+          </thead>
+          <tbody id="sender-history-body">
+            <!-- Dynamic documents rows will be rendered by renderSenderHistory() -->
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Pagination Controls -->
+      <div class="pagination-controls" id="sender-history-pagination">
+        <div class="pagination-left">
+          <span class="info" id="sender-history-pagination-info">Mostrando 0 - 0 de 0 registros</span>
+          <span style="color:var(--text-muted); font-size:0.8rem; margin:0 0.5rem;">|</span>
+          <label for="sender-history-page-size" style="font-size:0.8rem; color:var(--text-secondary);">Mostrar:</label>
+          <select class="page-size-select" id="sender-history-page-size">
+            <option value="20" ${senderHistoryPageSize === 20 ? 'selected' : ''}>20</option>
+            <option value="50" ${senderHistoryPageSize === 50 ? 'selected' : ''}>50</option>
+            <option value="100" ${senderHistoryPageSize === 100 ? 'selected' : ''}>100</option>
+            <option value="300" ${senderHistoryPageSize === 300 ? 'selected' : ''}>300</option>
+          </select>
+        </div>
+        <div class="pagination-buttons" id="sender-history-pagination-btns"></div>
+      </div>
+    </div>
+
+    <!-- Panel 2: Historical Database Senders -->
+    <div id="sender-historical-panel" style="display: ${currentSenderTab === 'historical' ? 'block' : 'none'};">
+      <!-- Dynamic loading state, upload view or results table will be rendered here -->
+    </div>
+  `;
+
+  // Attach event listener for history column sorting
+  const headers = container.querySelectorAll('#sender-history-table th.sortable');
+  headers.forEach(th => {
+    th.addEventListener('click', () => {
+      const colName = th.getAttribute('data-history-col');
+      if (senderHistorySortCol === colName) {
+        senderHistorySortDir = senderHistorySortDir === 'asc' ? 'desc' : 'asc';
+      } else {
+        senderHistorySortCol = colName;
+        senderHistorySortDir = 'asc';
+      }
+      sortSenderHistory();
+      renderSenderDetailsCardForGroup(); // Re-render headers to update sort direction icons
+      renderSenderHistory();            // Populate table rows
+    });
+  });
+
+  // Attach event listener for page size selector change
+  container.querySelector('#sender-history-page-size').addEventListener('change', (e) => {
+    senderHistoryPageSize = parseInt(e.target.value);
+    senderHistoryCurrentPage = 1;
+    renderSenderHistory();
+  });
+
+  // Sync historical rendering if historical tab is active
+  if (currentSenderTab === 'historical') {
+    checkAndRenderHistoricalData();
+  }
+}
+
 function renderSenderDetailsCard(senderData) {
   const container = document.getElementById('sender-details-container');
   
@@ -1104,42 +1331,72 @@ function renderSenderDetailsCard(senderData) {
       </div>
     </div>
 
-    <!-- History Results List -->
-    <h3 style="font-size:0.95rem; font-weight:700; margin-bottom:0.75rem; color:var(--text-primary);">Historial de Documentos Presentados</h3>
-    
-    <div class="table-container">
-      <table class="data-table" id="sender-history-table">
-        <thead>
-          <tr>
-            <th class="sortable ${senderHistorySortCol === 'index' ? (senderHistorySortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-history-col="index">N°</th>
-            <th class="sortable ${senderHistorySortCol === 'CUT' ? (senderHistorySortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-history-col="CUT">CUT</th>
-            <th class="sortable ${senderHistorySortCol === 'Fecha de Creación de Tramite' ? (senderHistorySortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-history-col="Fecha de Creación de Tramite">Fecha de Creación de Trámite</th>
-            <th class="sortable ${senderHistorySortCol === 'Documento Origen' ? (senderHistorySortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-history-col="Documento Origen">Documento Origen</th>
-            <th class="sortable ${senderHistorySortCol === 'Asunto Origen' ? (senderHistorySortDir === 'asc' ? (senderHistorySortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : '') : ''}" data-history-col="Asunto Origen">Asunto</th>
-            <th>Revisión</th>
-            <th style="text-align:right;">Acción</th>
-          </tr>
-        </thead>
-        <tbody id="sender-history-body">
-          <!-- Dynamic documents rows -->
-        </tbody>
-      </table>
+    <!-- Sender Detail Sub-Tabs -->
+    <div class="sender-tabs">
+      <button class="sender-tab-btn ${currentSenderTab === 'current' ? 'active' : ''}" id="btn-sender-tab-current" onclick="switchSenderTab('current')">
+        Base de Datos Actual
+      </button>
+      <button class="sender-tab-btn ${currentSenderTab === 'historical' ? 'active' : ''}" id="btn-sender-tab-historical" onclick="switchSenderTab('historical')">
+        Historial 2024-2026
+      </button>
     </div>
 
-    <!-- Pagination Controls -->
-    <div class="pagination-controls" id="sender-history-pagination">
-      <div class="pagination-left">
-        <span class="info" id="sender-history-pagination-info">Mostrando 0 - 0 de 0 registros</span>
-        <span style="color:var(--text-muted); font-size:0.8rem; margin:0 0.5rem;">|</span>
-        <label for="sender-history-page-size" style="font-size:0.8rem; color:var(--text-secondary);">Mostrar:</label>
-        <select class="page-size-select" id="sender-history-page-size">
-          <option value="20" ${senderHistoryPageSize === 20 ? 'selected' : ''}>20</option>
-          <option value="50" ${senderHistoryPageSize === 50 ? 'selected' : ''}>50</option>
-          <option value="100" ${senderHistoryPageSize === 100 ? 'selected' : ''}>100</option>
-          <option value="300" ${senderHistoryPageSize === 300 ? 'selected' : ''}>300</option>
-        </select>
+    <!-- Panel 1: Current Database Senders -->
+    <div id="sender-current-panel" style="display: ${currentSenderTab === 'current' ? 'block' : 'none'};">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem; flex-wrap:wrap; gap:0.5rem;">
+        <h3 style="font-size:0.95rem; font-weight:700; color:var(--text-primary); margin:0;">Historial de Documentos Presentados</h3>
+        <button class="btn-success" id="sender-export-btn" onclick="exportSenderHistoryAsCSV()" style="padding:0.35rem 0.75rem; font-size:0.7rem;" title="Exportar historial del remitente a CSV con sus observaciones">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:12px; height:12px;">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+            <polyline points="7 10 12 15 17 10"></polyline>
+            <line x1="12" y1="15" x2="12" y2="3"></line>
+          </svg>
+          Exportar Historial
+        </button>
       </div>
-      <div class="pagination-buttons" id="sender-history-pagination-btns"></div>
+      
+      <div class="table-container">
+        <table class="data-table" id="sender-history-table">
+          <thead>
+            <tr>
+              <th class="sortable ${senderHistorySortCol === 'index' ? (senderHistorySortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-history-col="index">N°</th>
+              <th class="sortable ${senderHistorySortCol === 'CUT' ? (senderHistorySortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-history-col="CUT">CUT</th>
+              <th class="sortable ${senderHistorySortCol === 'count' ? (senderHistorySortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-history-col="count">Registros</th>
+              <th class="sortable ${senderHistorySortCol === 'Fecha de Creación de Tramite' ? (senderHistorySortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-history-col="Fecha de Creación de Tramite">Fecha de Creación de Trámite</th>
+              <th class="sortable ${senderHistorySortCol === 'Remitente' ? (senderHistorySortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-history-col="Remitente">Remitente</th>
+              <th class="sortable ${senderHistorySortCol === 'Documento Origen' ? (senderHistorySortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-history-col="Documento Origen">Documento Origen</th>
+              <th class="sortable ${senderHistorySortCol === 'Asunto Origen' ? (senderHistorySortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-history-col="Asunto Origen">Asunto</th>
+              <th class="sortable ${senderHistorySortCol === 'Último Documento' ? (senderHistorySortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-history-col="Último Documento">Último Documento</th>
+              <th>Revisión</th>
+              <th style="text-align:right;">Acción</th>
+            </tr>
+          </thead>
+          <tbody id="sender-history-body">
+            <!-- Dynamic documents rows will be rendered by renderSenderHistory() -->
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Pagination Controls -->
+      <div class="pagination-controls" id="sender-history-pagination">
+        <div class="pagination-left">
+          <span class="info" id="sender-history-pagination-info">Mostrando 0 - 0 de 0 registros</span>
+          <span style="color:var(--text-muted); font-size:0.8rem; margin:0 0.5rem;">|</span>
+          <label for="sender-history-page-size" style="font-size:0.8rem; color:var(--text-secondary);">Mostrar:</label>
+          <select class="page-size-select" id="sender-history-page-size">
+            <option value="20" ${senderHistoryPageSize === 20 ? 'selected' : ''}>20</option>
+            <option value="50" ${senderHistoryPageSize === 50 ? 'selected' : ''}>50</option>
+            <option value="100" ${senderHistoryPageSize === 100 ? 'selected' : ''}>100</option>
+            <option value="300" ${senderHistoryPageSize === 300 ? 'selected' : ''}>300</option>
+          </select>
+        </div>
+        <div class="pagination-buttons" id="sender-history-pagination-btns"></div>
+      </div>
+    </div>
+
+    <!-- Panel 2: Historical Database Senders -->
+    <div id="sender-historical-panel" style="display: ${currentSenderTab === 'historical' ? 'block' : 'none'};">
+      <!-- Dynamic loading state, upload view or results table will be rendered here -->
     </div>
   `;
 
@@ -1155,8 +1412,8 @@ function renderSenderDetailsCard(senderData) {
         senderHistorySortDir = 'asc';
       }
       sortSenderHistory();
-      renderSenderHistory();
       renderSenderDetailsCard(senderData); // Re-render headers to update sort direction icons
+      renderSenderHistory();            // Populate table rows
     });
   });
 
@@ -1166,27 +1423,73 @@ function renderSenderDetailsCard(senderData) {
     senderHistoryCurrentPage = 1;
     renderSenderHistory();
   });
+
+  // Sync historical rendering if historical tab is active
+  if (currentSenderTab === 'historical') {
+    checkAndRenderHistoricalData();
+  }
 }
 
 function sortSenderHistory() {
-  if (senderHistorySortCol === 'index') {
-    selectedSenderRecords.sort((a, b) => {
-      return senderHistorySortDir === 'asc' ? a.index - b.index : b.index - a.index;
-    });
-  } else if (senderHistorySortCol === 'Fecha de Creación de Tramite') {
-    selectedSenderRecords.sort((a, b) => {
-      const dateA = parseDate(a['Fecha de Creación de Tramite']) || new Date(0);
-      const dateB = parseDate(b['Fecha de Creación de Tramite']) || new Date(0);
-      return senderHistorySortDir === 'asc' ? dateA - dateB : dateB - dateA;
-    });
+  // Grouped records sorting is handled dynamically in renderSenderHistory
+}
+
+function groupRecordsByCUT(records) {
+  const groups = {};
+  const cutOrder = [];
+  
+  records.forEach(rec => {
+    const cut = (rec.CUT && rec.CUT !== '-') ? rec.CUT.trim() : `NO_CUT_${rec.index}`;
+    if (!groups[cut]) {
+      groups[cut] = [];
+      cutOrder.push(cut);
+    }
+    groups[cut].push(rec);
+  });
+  
+  return cutOrder.map(cut => {
+    const groupRecs = groups[cut];
+    const firstRec = groupRecs[0];
+    
+    const dates = [...new Set(groupRecs.map(r => r['Fecha de Creación de Tramite']).filter(Boolean))];
+    const dateStr = dates.join(', ');
+    
+    const docs = [...new Set(groupRecs.map(r => r['Documento Origen']).filter(Boolean))];
+    const docStr = docs.join(' | ');
+    
+    const asuntos = [...new Set(groupRecs.map(r => r['Asunto Origen']).filter(Boolean))];
+    const asuntoStr = asuntos.join(' | ');
+    
+    const ultimos = [...new Set(groupRecs.map(r => r['Último Documento']).filter(Boolean))];
+    const ultimoStr = ultimos.join(' | ');
+    
+    const displayCut = cut.startsWith('NO_CUT_') ? '-' : cut;
+    
+    return {
+      index: firstRec.index,
+      CUT: displayCut,
+      'Fecha de Creación de Tramite': dateStr,
+      Remitente: firstRec.Remitente,
+      'Documento Origen': docStr,
+      'Asunto Origen': asuntoStr,
+      'Último Documento': ultimoStr || '-',
+      count: groupRecs.length,
+      records: groupRecs
+    };
+  });
+}
+
+function toggleRowExpansion(cut) {
+  const detailRow = document.getElementById(`detail-row-${cut}`);
+  const icon = document.getElementById(`toggle-icon-${cut}`);
+  if (!detailRow) return;
+
+  if (detailRow.style.display === 'none') {
+    detailRow.style.display = 'table-row';
+    if (icon) icon.style.transform = 'rotate(90deg)';
   } else {
-    selectedSenderRecords.sort((a, b) => {
-      const valA = (a[senderHistorySortCol] || '').toString().toLowerCase();
-      const valB = (b[senderHistorySortCol] || '').toString().toLowerCase();
-      if (valA < valB) return senderHistorySortDir === 'asc' ? -1 : 1;
-      if (valA > valB) return senderHistorySortDir === 'asc' ? 1 : -1;
-      return 0;
-    });
+    detailRow.style.display = 'none';
+    if (icon) icon.style.transform = 'rotate(0deg)';
   }
 }
 
@@ -1194,36 +1497,134 @@ function renderSenderHistory() {
   const tableBody = document.getElementById('sender-history-body');
   if (!tableBody) return;
 
+  const groupedRecords = groupRecordsByCUT(selectedSenderRecords);
+
+  // Sort grouped records
+  if (senderHistorySortCol === 'count') {
+    groupedRecords.sort((a, b) => {
+      return senderHistorySortDir === 'asc' ? a.count - b.count : b.count - a.count;
+    });
+  } else if (senderHistorySortCol === 'index') {
+    groupedRecords.sort((a, b) => {
+      return senderHistorySortDir === 'asc' ? a.index - b.index : b.index - a.index;
+    });
+  } else if (senderHistorySortCol === 'Fecha de Creación de Tramite') {
+    groupedRecords.sort((a, b) => {
+      const dateA = parseDate(a.records[0]['Fecha de Creación de Tramite']) || new Date(0);
+      const dateB = parseDate(b.records[0]['Fecha de Creación de Tramite']) || new Date(0);
+      return senderHistorySortDir === 'asc' ? dateA - dateB : dateB - dateA;
+    });
+  } else {
+    groupedRecords.sort((a, b) => {
+      const valA = (a[senderHistorySortCol] || '').toString().toLowerCase();
+      const valB = (b[senderHistorySortCol] || '').toString().toLowerCase();
+      if (valA < valB) return senderHistorySortDir === 'asc' ? -1 : 1;
+      if (valA > valB) return senderHistorySortDir === 'asc' ? 1 : -1;
+      return 0;
+    });
+  }
+
   const startIdx = (senderHistoryCurrentPage - 1) * senderHistoryPageSize;
-  const pageSlice = selectedSenderRecords.slice(startIdx, startIdx + senderHistoryPageSize);
+  const pageSlice = groupedRecords.slice(startIdx, startIdx + senderHistoryPageSize);
 
   let html = '';
   pageSlice.forEach(rec => {
-    const hasObs = observations[rec.CUT];
+    const hasObs = rec.records.some(r => !!observations[r.CUT]);
     const obsText = hasObs 
-      ? `<span class="obs-indicator" title="${hasObs.replace(/"/g, '&quot;')}">
+      ? `<span class="obs-indicator" title="Al menos un documento en este CUT tiene observaciones">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:12px; height:12px; vertical-align:middle;">
             <polyline points="20 6 9 17 4 12"></polyline>
           </svg> Con Obs.
          </span>`
       : `<span style="color: var(--text-muted); font-size: 0.75rem;">Sin obs.</span>`;
 
+    const countBadge = rec.count > 1 
+      ? `<span class="badge" style="background:rgba(239, 68, 68, 0.15); color:var(--danger); font-size:0.65rem; padding:0.15rem 0.35rem; border-radius:4px; font-weight:700;" title="${rec.count} registros duplicados">${rec.count} registros</span>`
+      : `<span class="badge" style="background:rgba(107, 114, 128, 0.1); color:var(--text-muted); font-size:0.65rem; padding:0.15rem 0.35rem; border-radius:4px;" title="1 registro único">1 registro</span>`;
+
+    // Render nested sub-table HTML
+    let subTableRows = '';
+    rec.records.forEach((subRec, subIdx) => {
+      const subHasObs = observations[subRec.CUT];
+      const subObsBadge = subHasObs
+        ? `<span class="obs-indicator" title="${subHasObs.replace(/"/g, '&quot;')}">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:12px; height:12px; vertical-align:middle;">
+              <polyline points="20 6 9 17 4 12"></polyline>
+            </svg> Con Obs.
+           </span>`
+        : `<span style="color: var(--text-muted); font-size: 0.75rem;">Sin obs.</span>`;
+
+      subTableRows += `
+        <tr style="background: var(--bg-tertiary);">
+          <td style="font-weight: 500; color: var(--text-muted); text-align: center;">${subIdx + 1}</td>
+          <td>${subRec['Fecha de Creación de Tramite']}</td>
+          <td class="doc-cell" style="font-size:0.75rem;" title="${subRec['Documento Origen']}">${subRec['Documento Origen']}</td>
+          <td class="asunto-cell" style="font-size:0.75rem;" title="${subRec['Asunto Origen']}">${subRec['Asunto Origen']}</td>
+          <td class="doc-cell" style="font-size:0.75rem;" title="${subRec['Último Documento']}">${subRec['Último Documento']}</td>
+          <td>${subObsBadge}</td>
+          <td style="text-align:right;">
+            <button class="action-btn" onclick="openRevisionModal(${subRec.index}); event.stopPropagation();" title="Revisar expediente">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:12px; height:12px; margin-right:2px;">
+                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+                <path d="M18.5 2.5a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4z"></path>
+              </svg>
+              Revisar
+            </button>
+          </td>
+        </tr>
+      `;
+    });
+
+    const subTableHtml = `
+      <div style="background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem; margin: 0.25rem 0; overflow-x: auto; max-width: 100%;">
+        <div style="font-weight: 700; font-size: 0.75rem; margin-bottom: 0.4rem; color: var(--accent); display:flex; align-items:center; gap:0.25rem;">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px; height:14px;"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+          Árbol de Documentos del CUT: ${rec.CUT}
+        </div>
+        <table class="data-table" style="font-size: 0.72rem; margin: 0; width: 100%;">
+          <thead>
+            <tr style="background: var(--border);">
+              <th style="width: 40px; text-align: center;">N°</th>
+              <th>Fecha Creación</th>
+              <th>Documento Origen</th>
+              <th>Asunto Origen</th>
+              <th>Último Documento</th>
+              <th>Revisión</th>
+              <th style="text-align:right; width: 100px;">Acción</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${subTableRows}
+          </tbody>
+        </table>
+      </div>
+    `;
+
     html += `
-      <tr>
-        <td class="num-cell">${rec.index}</td>
-        <td class="cut-cell">${rec.CUT}</td>
+      <tr onclick="toggleRowExpansion('${rec.CUT}')" style="cursor: pointer; transition: background-color 0.15s;" onmouseover="this.style.backgroundColor='var(--bg-secondary)'" onmouseout="this.style.backgroundColor=''">
+        <td class="num-cell">
+          <span id="toggle-icon-${rec.CUT}" style="display:inline-block; transition: transform 0.2s; margin-right: 0.35rem; font-size: 0.65rem; color: var(--text-muted); transform: rotate(0deg);">▶</span>
+          ${rec.index}
+        </td>
+        <td class="cut-cell" style="font-weight: 700;">${rec.CUT}</td>
+        <td>${countBadge}</td>
         <td style="white-space: nowrap;">${rec['Fecha de Creación de Tramite']}</td>
-        <td style="font-size:0.75rem;" title="${rec['Documento Origen']}">${rec['Documento Origen']}</td>
+        <td>${rec.Remitente}</td>
+        <td class="doc-cell" style="font-size:0.75rem;" title="${rec['Documento Origen']}">${rec['Documento Origen']}</td>
         <td class="asunto-cell" title="${rec['Asunto Origen']}">${rec['Asunto Origen']}</td>
+        <td class="doc-cell" style="font-size:0.75rem;" title="${rec['Último Documento']}">${rec['Último Documento']}</td>
         <td>${obsText}</td>
         <td style="text-align:right;">
-          <button class="action-btn" onclick="openRevisionModal(${rec.index})">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
-              <path d="M18.5 2.5a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4z"></path>
-            </svg>
-            Revisar
+          <button class="action-btn" onclick="toggleRowExpansion('${rec.CUT}'); event.stopPropagation();" style="padding: 0.25rem 0.5rem; font-size:0.7rem;">
+            Ver Info
           </button>
+        </td>
+      </tr>
+      <tr class="detail-row" id="detail-row-${rec.CUT}" style="display: none; background: var(--bg-secondary);">
+        <td colspan="10" style="padding: 0.5rem 1rem;">
+          <div style="border-left: 3px solid var(--accent); padding-left: 0.75rem;">
+            ${subTableHtml}
+          </div>
         </td>
       </tr>
     `;
@@ -1235,7 +1636,7 @@ function renderSenderHistory() {
     containerId: 'sender-history-pagination',
     infoId: 'sender-history-pagination-info',
     btnsId: 'sender-history-pagination-btns',
-    totalRecords: selectedSenderRecords.length,
+    totalRecords: groupedRecords.length,
     currentPage: senderHistoryCurrentPage,
     pageSize: senderHistoryPageSize,
     onPageChange: (newPage) => {
@@ -1243,6 +1644,14 @@ function renderSenderHistory() {
       renderSenderHistory();
     }
   });
+
+  // Update unique CUTs and total documents count label
+  const paginationInfo = document.getElementById('sender-history-pagination-info');
+  if (paginationInfo) {
+    const startIdxShow = groupedRecords.length === 0 ? 0 : startIdx + 1;
+    const endIdxShow = Math.min(startIdx + senderHistoryPageSize, groupedRecords.length);
+    paginationInfo.innerHTML = `Mostrando ${startIdxShow} - ${endIdxShow} de <strong>${groupedRecords.length}</strong> CUTs únicos (Total: ${selectedSenderRecords.length} registros)`;
+  }
 }
 
 
@@ -1470,8 +1879,11 @@ function filterObservationsList() {
   cutsWithObs.forEach(cut => {
     const obsText = observations[cut] || '';
     
-    // Find metadata of this CUT (get the first matching record in rawRecords)
-    const rec = rawRecords.find(r => r.CUT === cut);
+    // Find metadata of this CUT (get the first matching record in rawRecords or historicalRecords)
+    let rec = rawRecords.find(r => r.CUT === cut);
+    if (!rec && typeof historicalRecords !== 'undefined') {
+      rec = historicalRecords.find(r => r.CUT === cut);
+    }
     if (!rec) return;
 
     if (query) {
@@ -1606,23 +2018,248 @@ function exportObservationsAsJSON() {
 }
 
 function exportObservationsAsCSV() {
-  if (Object.keys(observations).length === 0) {
+  const recordsToExport = rawRecords.filter(rec => observations[rec.CUT] !== undefined);
+
+  if (recordsToExport.length === 0) {
     alert('No hay observaciones registradas para exportar.');
     return;
   }
 
-  let csvRows = ['"CUT";"Observación de Revisión"'];
-  Object.keys(observations).forEach(cut => {
-    const text = (observations[cut] || '').replace(/"/g, '""');
-    csvRows.push(`"${cut}";"${text}"`);
+  const originalHeaders = (rawRecords.length > 0 && rawRecords[0]._original) ? Object.keys(rawRecords[0]._original) : [];
+  const headers = [...originalHeaders, 'Observación de Revisión'];
+
+  const escapeCsvValue = (val) => {
+    if (val === null || val === undefined) return '';
+    return '"' + val.toString().replace(/"/g, '""') + '"';
+  };
+
+  let csvRows = [headers.map(escapeCsvValue).join(';')];
+
+  recordsToExport.forEach(rec => {
+    if (rec._original) {
+      const obsText = observations[rec.CUT] || '';
+      const row = originalHeaders.map(h => rec._original[h] || '');
+      row.push(obsText);
+      csvRows.push(row.map(escapeCsvValue).join(';'));
+    }
   });
 
-  const blob = new Blob([csvRows.join('\n')], { type: 'text/csv;charset=utf-8;' });
+  const BOM = '\uFEFF';
+  const blob = new Blob([BOM + csvRows.join('\n')], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
   const dlAnchorElem = document.createElement('a');
   dlAnchorElem.setAttribute("href", url);
-  dlAnchorElem.setAttribute("download", `observaciones_sisged_ue002_${getFormattedDate()}.csv`);
+  dlAnchorElem.setAttribute("download", `todas_observaciones_sisged_ue002_${getFormattedDate()}.csv`);
   dlAnchorElem.click();
+  
+  setTimeout(() => URL.revokeObjectURL(url), 100);
+}
+
+function exportFilteredRecordsAsCSV() {
+  if (expFilteredRecords.length === 0) {
+    alert('No hay registros filtrados para exportar.');
+    return;
+  }
+
+  // Get original headers dynamically
+  const originalHeaders = expFilteredRecords[0]._original ? Object.keys(expFilteredRecords[0]._original) : [];
+  const headers = [...originalHeaders, 'Observación de Revisión'];
+
+  const escapeCsvValue = (val) => {
+    if (val === null || val === undefined) return '';
+    return '"' + val.toString().replace(/"/g, '""') + '"';
+  };
+
+  // Build CSV content starting with header
+  let csvRows = [headers.map(escapeCsvValue).join(';')];
+
+  expFilteredRecords.forEach(rec => {
+    if (rec._original) {
+      const obsText = observations[rec.CUT] || '';
+      const row = originalHeaders.map(h => rec._original[h] || '');
+      row.push(obsText);
+      csvRows.push(row.map(escapeCsvValue).join(';'));
+    }
+  });
+
+  // Create Blob with UTF-8 BOM to ensure Excel opens special characters correctly
+  const BOM = '\uFEFF';
+  const blob = new Blob([BOM + csvRows.join('\n')], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const dlAnchorElem = document.createElement('a');
+  dlAnchorElem.setAttribute("href", url);
+  dlAnchorElem.setAttribute("download", `tramites_filtrados_sisged_ue002_${getFormattedDate()}.csv`);
+  dlAnchorElem.click();
+  
+  // Clean up URL object
+  setTimeout(() => URL.revokeObjectURL(url), 100);
+}
+
+function exportSenderHistoryAsCSV() {
+  if (!selectedSenderId || selectedSenderRecords.length === 0) {
+    alert('No hay historial de remitente para exportar.');
+    return;
+  }
+
+  const originalHeaders = selectedSenderRecords[0]._original ? Object.keys(selectedSenderRecords[0]._original) : [];
+  const headers = [...originalHeaders, 'Observación de Revisión'];
+
+  const escapeCsvValue = (val) => {
+    if (val === null || val === undefined) return '';
+    return '"' + val.toString().replace(/"/g, '""') + '"';
+  };
+
+  let csvRows = [headers.map(escapeCsvValue).join(';')];
+
+  selectedSenderRecords.forEach(rec => {
+    if (rec._original) {
+      const obsText = observations[rec.CUT] || '';
+      const row = originalHeaders.map(h => rec._original[h] || '');
+      row.push(obsText);
+      csvRows.push(row.map(escapeCsvValue).join(';'));
+    }
+  });
+
+  const BOM = '\uFEFF';
+  const blob = new Blob([BOM + csvRows.join('\n')], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const dlAnchorElem = document.createElement('a');
+  dlAnchorElem.setAttribute("href", url);
+  
+  const searchInput = document.getElementById('search-sender');
+  const query = searchInput ? searchInput.value.trim() : '';
+  const nameToUse = selectedSenderId === 'ALL_FILTERED_SENDERS' ? (query || 'todos_filtrados') : selectedSenderId;
+  dlAnchorElem.setAttribute("download", `historial_${nameToUse.replace(/[^a-zA-Z0-9]/g, '_')}_sisged_ue002_${getFormattedDate()}.csv`);
+  dlAnchorElem.click();
+  
+  setTimeout(() => URL.revokeObjectURL(url), 100);
+}
+
+function exportDuplicatesAsCSV() {
+  if (dupFilteredList.length === 0) {
+    alert('No hay registros duplicados para exportar.');
+    return;
+  }
+
+  let sampleRec = null;
+  for (let i = 0; i < dupFilteredList.length; i++) {
+    if (dupFilteredList[i].records && dupFilteredList[i].records.length > 0) {
+      sampleRec = dupFilteredList[i].records[0];
+      break;
+    }
+  }
+
+  const originalHeaders = sampleRec && sampleRec._original ? Object.keys(sampleRec._original) : [];
+  const headers = [...originalHeaders, 'Observación de Revisión'];
+
+  const escapeCsvValue = (val) => {
+    if (val === null || val === undefined) return '';
+    return '"' + val.toString().replace(/"/g, '""') + '"';
+  };
+
+  let csvRows = [headers.map(escapeCsvValue).join(';')];
+
+  dupFilteredList.forEach(dupItem => {
+    const obsText = observations[dupItem.cut] || '';
+    dupItem.records.forEach(rec => {
+      if (rec._original) {
+        const row = originalHeaders.map(h => rec._original[h] || '');
+        row.push(obsText);
+        csvRows.push(row.map(escapeCsvValue).join(';'));
+      }
+    });
+  });
+
+  const BOM = '\uFEFF';
+  const blob = new Blob([BOM + csvRows.join('\n')], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const dlAnchorElem = document.createElement('a');
+  dlAnchorElem.setAttribute("href", url);
+  dlAnchorElem.setAttribute("download", `cuts_duplicados_sisged_ue002_${getFormattedDate()}.csv`);
+  dlAnchorElem.click();
+  
+  setTimeout(() => URL.revokeObjectURL(url), 100);
+}
+
+function exportFilteredObservationsAsCSV() {
+  if (obsFilteredList.length === 0) {
+    alert('No hay observaciones filtradas para exportar.');
+    return;
+  }
+
+  const sampleRec = rawRecords.find(r => r.index === obsFilteredList[0].recordIndex);
+  const originalHeaders = sampleRec && sampleRec._original ? Object.keys(sampleRec._original) : [];
+  const headers = [...originalHeaders, 'Observación de Revisión'];
+
+  const escapeCsvValue = (val) => {
+    if (val === null || val === undefined) return '';
+    return '"' + val.toString().replace(/"/g, '""') + '"';
+  };
+
+  let csvRows = [headers.map(escapeCsvValue).join(';')];
+
+  obsFilteredList.forEach(item => {
+    const rec = rawRecords.find(r => r.index === item.recordIndex);
+    if (rec && rec._original) {
+      const row = originalHeaders.map(h => rec._original[h] || '');
+      row.push(item.observation);
+      csvRows.push(row.map(escapeCsvValue).join(';'));
+    }
+  });
+
+  const BOM = '\uFEFF';
+  const blob = new Blob([BOM + csvRows.join('\n')], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const dlAnchorElem = document.createElement('a');
+  dlAnchorElem.setAttribute("href", url);
+  dlAnchorElem.setAttribute("download", `observaciones_filtradas_sisged_ue002_${getFormattedDate()}.csv`);
+  dlAnchorElem.click();
+  
+  setTimeout(() => URL.revokeObjectURL(url), 100);
+}
+
+function exportFilteredSendersAsCSV() {
+  if (senderFilteredList.length === 0) {
+    alert('No hay remitentes filtrados para exportar.');
+    return;
+  }
+
+  const senderNames = new Set(senderFilteredList.map(s => s.name));
+  const recordsToExport = rawRecords.filter(rec => senderNames.has(rec.Remitente));
+
+  if (recordsToExport.length === 0) {
+    alert('No hay registros para exportar.');
+    return;
+  }
+
+  const originalHeaders = (rawRecords.length > 0 && rawRecords[0]._original) ? Object.keys(rawRecords[0]._original) : [];
+  const headers = [...originalHeaders, 'Observación de Revisión'];
+
+  const escapeCsvValue = (val) => {
+    if (val === null || val === undefined) return '';
+    return '"' + val.toString().replace(/"/g, '""') + '"';
+  };
+
+  let csvRows = [headers.map(escapeCsvValue).join(';')];
+
+  recordsToExport.forEach(rec => {
+    if (rec._original) {
+      const obsText = observations[rec.CUT] || '';
+      const row = originalHeaders.map(h => rec._original[h] || '');
+      row.push(obsText);
+      csvRows.push(row.map(escapeCsvValue).join(';'));
+    }
+  });
+
+  const BOM = '\uFEFF';
+  const blob = new Blob([BOM + csvRows.join('\n')], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const dlAnchorElem = document.createElement('a');
+  dlAnchorElem.setAttribute("href", url);
+  dlAnchorElem.setAttribute("download", `tramites_remitentes_filtrados_sisged_ue002_${getFormattedDate()}.csv`);
+  dlAnchorElem.click();
+  
+  setTimeout(() => URL.revokeObjectURL(url), 100);
 }
 
 function importObservationsJSON(event) {
@@ -1671,7 +2308,12 @@ function getFormattedDate() {
 // ==========================================
 
 function openRevisionModal(recordIndex) {
-  const rec = rawRecords.find(r => r.index === recordIndex);
+  let rec;
+  if (typeof recordIndex === 'string' && recordIndex.startsWith('hist-')) {
+    rec = historicalRecords.find(r => r.index === recordIndex);
+  } else {
+    rec = rawRecords.find(r => r.index === recordIndex);
+  }
   if (!rec) return;
 
   activeModalRecord = rec;
@@ -1702,9 +2344,501 @@ function submitModalObservation() {
   hideModal();
 }
 
+// ==========================================
+// VIEW 2: HISTORICAL SENDER MATCHING LOGIC
+// ==========================================
+
+function switchSenderTab(tab) {
+  currentSenderTab = tab;
+  const btnCurrent = document.getElementById('btn-sender-tab-current');
+  const btnHist = document.getElementById('btn-sender-tab-historical');
+  const divCurrent = document.getElementById('sender-current-panel');
+  const divHist = document.getElementById('sender-historical-panel');
+
+  if (!btnCurrent || !btnHist || !divCurrent || !divHist) return;
+
+  if (tab === 'current') {
+    btnCurrent.classList.add('active');
+    btnHist.classList.remove('active');
+    divCurrent.style.display = 'block';
+    divHist.style.display = 'none';
+  } else {
+    btnHist.classList.add('active');
+    btnCurrent.classList.remove('active');
+    divCurrent.style.display = 'none';
+    divHist.style.display = 'block';
+    checkAndRenderHistoricalData();
+  }
+}
+
+function checkAndRenderHistoricalData() {
+  const panel = document.getElementById('sender-historical-panel');
+  if (!panel) return;
+
+  if (historicalRecords.length === 0) {
+    if (isHistoricalLoading) {
+      panel.innerHTML = `
+        <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; padding:3rem 1rem; gap:1rem;">
+          <div class="spinner" style="border: 3px solid rgba(13, 148, 136, 0.1); border-top-color: var(--accent); width: 24px; height: 24px; border-radius: 50%; animation: spin 1s infinite linear;"></div>
+          <div style="font-size:0.9rem; color:var(--text-secondary); text-align:center;">
+            Cargando y procesando base de datos histórica...<br>
+            <span style="font-size:0.75rem; color:var(--text-muted);">Esto puede demorar unos segundos debido al tamaño del archivo (22.9 MB).</span>
+          </div>
+        </div>
+      `;
+      return;
+    }
+    
+    panel.innerHTML = `
+      <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; padding:3rem 1rem; border:2px dashed var(--border); border-radius:8px; gap:1rem; background:var(--bg-secondary); animation: fadeIn 0.3s ease-out;">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:48px; height:48px; color:var(--accent);">
+          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+          <circle cx="12" cy="13" r="3"></circle>
+          <polyline points="12 10 12 13 14 13"></polyline>
+        </svg>
+        <div style="text-align:center;">
+          <h4 style="margin:0 0 0.5rem 0; color:var(--text-primary);">Base de Datos Histórica no cargada</h4>
+          <p style="font-size:0.8rem; color:var(--text-secondary); max-width:400px; margin:0 auto 1rem auto; line-height:1.4;">
+            Para buscar coincidencias del remitente en todos los expedientes del 2024 al 2026, se requiere cargar el archivo <strong>Ingresados 2024 - 2026.csv</strong> de forma local.
+          </p>
+        </div>
+        <button class="upload-btn" onclick="loadHistoricalDatabase()" style="padding:0.5rem 1.25rem;">
+          🔍 Cargar e Iniciar Búsqueda
+        </button>
+      </div>
+    `;
+  } else {
+    searchHistoricalMatches();
+  }
+}
+
+function loadHistoricalDatabase() {
+  isHistoricalLoading = true;
+  checkAndRenderHistoricalData();
+
+  fetch('Ingresados 2024 - 2026.csv')
+    .then(response => {
+      if (!response.ok) throw new Error('No se pudo encontrar el archivo de forma automática.');
+      return response.text();
+    })
+    .then(csvText => {
+      parseHistoricalCSV(csvText);
+    })
+    .catch(error => {
+      console.warn("Auto-fetch of historical CSV failed, prompting file selector:", error);
+      
+      const tempInput = document.createElement('input');
+      tempInput.type = 'file';
+      tempInput.accept = '.csv';
+      
+      tempInput.onchange = (e) => {
+        const file = e.target.files[0];
+        if (!file) {
+          isHistoricalLoading = false;
+          checkAndRenderHistoricalData();
+          return;
+        }
+        
+        isHistoricalLoading = true;
+        checkAndRenderHistoricalData();
+        
+        const reader = new FileReader();
+        reader.onload = (evt) => {
+          parseHistoricalCSV(evt.target.result);
+        };
+        reader.onerror = () => {
+          alert('Error al leer el archivo histórico.');
+          isHistoricalLoading = false;
+          checkAndRenderHistoricalData();
+        };
+        reader.readAsText(file, 'UTF-8');
+      };
+      
+      tempInput.click();
+    });
+}
+
+function parseHistoricalCSV(csvText) {
+  Papa.parse(csvText, {
+    header: true,
+    skipEmptyLines: true,
+    delimiter: ';',
+    complete: function (results) {
+      if (results.errors.length > 0) {
+        console.warn("PapaParse errors during historical file parse:", results.errors);
+      }
+      processHistoricalRecords(results.data);
+      isHistoricalLoading = false;
+      searchHistoricalMatches();
+    },
+    error: function (error) {
+      alert("Error al parsear el archivo CSV histórico: " + error.message);
+      isHistoricalLoading = false;
+      checkAndRenderHistoricalData();
+    }
+  });
+}
+
+function processHistoricalRecords(data) {
+  let counter = 1;
+  historicalRecords = data.map(row => {
+    const rawName = (row.REMITENTE || '').trim();
+    let cleanName = rawName;
+    if (rawName.includes('[P. JURIDICA]')) {
+      cleanName = rawName.replace('[P. JURIDICA]', '').trim();
+    } else if (rawName.includes('[P. NATURAL]')) {
+      cleanName = rawName.replace('[P. NATURAL]', '').trim();
+    }
+
+    return {
+      index: 'hist-' + counter++,
+      CUT: (row.NRO_CUT || '').trim(),
+      'Fecha de Creación de Tramite': (row.FEC_CREACION || '').trim(),
+      'Documento Origen': (row.NRO_DOCUMENTO || '').trim(),
+      'Asunto Origen': (row.ASUNTO || '').trim(),
+      Remitente: cleanName,
+      'Origen': row.ORIGEN || '',
+      _original: row
+    };
+  });
+  console.log(`Processed ${historicalRecords.length} historical records.`);
+}
+
+function searchHistoricalMatches() {
+  const searchInput = document.getElementById('search-sender');
+  const query = searchInput ? searchInput.value.trim().toLowerCase() : '';
+  const cleanName = query || (selectedSenderId ? selectedSenderId.trim().toLowerCase() : '');
+
+  if (!cleanName) {
+    historicalFilteredRecords = [];
+    historicalCurrentPage = 1;
+    renderHistoricalHistory();
+    return;
+  }
+  
+  historicalFilteredRecords = historicalRecords.filter(rec => {
+    if (!rec.Remitente) return false;
+    const recName = rec.Remitente.trim().toLowerCase();
+    return recName.includes(cleanName);
+  });
+
+  historicalCurrentPage = 1;
+  sortHistoricalMatches();
+  renderHistoricalHistory();
+}
+
+function sortHistoricalMatches() {}
+
+function renderHistoricalHistory() {
+  const panel = document.getElementById('sender-historical-panel');
+  if (!panel) return;
+
+  const groupedRecords = groupRecordsByCUT(historicalFilteredRecords);
+  const currentCutsSet = new Set(rawRecords.map(r => r.CUT).filter(c => c && c !== '-'));
+  const senderCutsSet = new Set(selectedSenderRecords.map(r => r.CUT).filter(c => c && c !== '-'));
+
+  // Sort grouped records
+  if (historicalSortCol === 'count') {
+    groupedRecords.sort((a, b) => {
+      return historicalSortDir === 'asc' ? a.count - b.count : b.count - a.count;
+    });
+  } else if (historicalSortCol === 'index') {
+    groupedRecords.sort((a, b) => {
+      const numA = parseInt(a.index.replace('hist-', ''));
+      const numB = parseInt(b.index.replace('hist-', ''));
+      return historicalSortDir === 'asc' ? numA - numB : numB - numA;
+    });
+  } else if (historicalSortCol === 'Fecha de Creación de Tramite') {
+    groupedRecords.sort((a, b) => {
+      const dateA = parseDate(a.records[0]['Fecha de Creación de Tramite']) || new Date(0);
+      const dateB = parseDate(b.records[0]['Fecha de Creación de Tramite']) || new Date(0);
+      return historicalSortDir === 'asc' ? dateA - dateB : dateB - dateA;
+    });
+  } else {
+    groupedRecords.sort((a, b) => {
+      const valA = (a[historicalSortCol] || '').toString().toLowerCase();
+      const valB = (b[historicalSortCol] || '').toString().toLowerCase();
+      if (valA < valB) return historicalSortDir === 'asc' ? -1 : 1;
+      if (valA > valB) return historicalSortDir === 'asc' ? 1 : -1;
+      return 0;
+    });
+  }
+
+  if (groupedRecords.length === 0) {
+    panel.innerHTML = `
+      <div style="color:var(--text-muted); font-size:0.85rem; text-align:center; padding:3rem 1rem;">
+        No se encontraron coincidencias en el archivo histórico 2024-2026.
+      </div>
+    `;
+    return;
+  }
+
+  const startIdx = (historicalCurrentPage - 1) * historicalPageSize;
+  const pageSlice = groupedRecords.slice(startIdx, startIdx + historicalPageSize);
+
+  let rowsHtml = '';
+  pageSlice.forEach(rec => {
+    const isPresentInCurrentDb = rec.CUT && rec.CUT !== '-' && currentCutsSet.has(rec.CUT);
+    const isSameSenderInCurrentDb = rec.CUT && rec.CUT !== '-' && senderCutsSet.has(rec.CUT);
+    
+    let highlightClass = '';
+    let dbBadge = '';
+    
+    if (isPresentInCurrentDb) {
+      highlightClass = 'row-highlight-active';
+      if (isSameSenderInCurrentDb) {
+        dbBadge = `<span class="badge-tag" style="background: var(--success-light); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.2); font-size: 0.65rem; margin-left: 0.5rem; text-transform: none; font-weight: 600;" title="Este CUT existe en la BD actual para el remitente seleccionado">En BD Actual (Mismo Remitente)</span>`;
+      } else {
+        dbBadge = `<span class="badge-tag" style="background: var(--accent-light); color: var(--accent); border: 1px solid var(--accent-border); font-size: 0.65rem; margin-left: 0.5rem; text-transform: none; font-weight: 600;" title="Este CUT existe en la BD actual pero para otro remitente">En BD Actual</span>`;
+      }
+    }
+
+    const hasObs = rec.records.some(r => !!observations[r.CUT]);
+    const obsText = hasObs 
+      ? `<span class="obs-indicator" title="Al menos un documento en este CUT tiene observaciones">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:12px; height:12px; vertical-align:middle;">
+            <polyline points="20 6 9 17 4 12"></polyline>
+          </svg> Con Obs.
+         </span>`
+      : `<span style="color: var(--text-muted); font-size: 0.75rem;">Sin obs.</span>`;
+
+    const countBadge = rec.count > 1 
+      ? `<span class="badge" style="background:rgba(239, 68, 68, 0.15); color:var(--danger); font-size:0.65rem; padding:0.15rem 0.35rem; border-radius:4px; font-weight:700;" title="${rec.count} registros duplicados">${rec.count} registros</span>`
+      : `<span class="badge" style="background:rgba(107, 114, 128, 0.1); color:var(--text-muted); font-size:0.65rem; padding:0.15rem 0.35rem; border-radius:4px;" title="1 registro único">1 registro</span>`;
+
+    // Render nested sub-table HTML
+    let subTableRows = '';
+    rec.records.forEach((subRec, subIdx) => {
+      const subHasObs = observations[subRec.CUT];
+      const subObsBadge = subHasObs
+        ? `<span class="obs-indicator" title="${subHasObs.replace(/"/g, '&quot;')}">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:12px; height:12px; vertical-align:middle;">
+              <polyline points="20 6 9 17 4 12"></polyline>
+            </svg> Con Obs.
+           </span>`
+        : `<span style="color: var(--text-muted); font-size: 0.75rem;">Sin obs.</span>`;
+
+      subTableRows += `
+        <tr style="background: var(--bg-tertiary);">
+          <td style="font-weight: 500; color: var(--text-muted); text-align: center;">${subIdx + 1}</td>
+          <td>${subRec['Fecha de Creación de Tramite']}</td>
+          <td class="doc-cell" style="font-size:0.75rem;" title="${subRec['Documento Origen']}">${subRec['Documento Origen']}</td>
+          <td class="asunto-cell" style="font-size:0.75rem;" title="${subRec['Asunto Origen']}">${subRec['Asunto Origen']}</td>
+          <td style="font-size:0.75rem; color:var(--text-muted);">-</td>
+          <td>${subObsBadge}</td>
+          <td style="text-align:right;">
+            <button class="action-btn" onclick="openRevisionModal('${subRec.index}'); event.stopPropagation();" title="Revisar expediente">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:12px; height:12px; margin-right:2px;">
+                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+                <path d="M18.5 2.5a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4z"></path>
+              </svg>
+              Revisar
+            </button>
+          </td>
+        </tr>
+      `;
+    });
+
+    const subTableHtml = `
+      <div style="background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem; margin: 0.25rem 0; overflow-x: auto; max-width: 100%;">
+        <div style="font-weight: 700; font-size: 0.75rem; margin-bottom: 0.4rem; color: var(--accent); display:flex; align-items:center; gap:0.25rem;">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px; height:14px;"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+          Árbol de Documentos Históricos del CUT: ${rec.CUT}
+        </div>
+        <table class="data-table" style="font-size: 0.72rem; margin: 0; width: 100%;">
+          <thead>
+            <tr style="background: var(--border);">
+              <th style="width: 40px; text-align: center;">N°</th>
+              <th>Fecha Creación</th>
+              <th>Documento Origen</th>
+              <th>Asunto Origen</th>
+              <th>Último Documento</th>
+              <th>Revisión</th>
+              <th style="text-align:right; width: 100px;">Acción</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${subTableRows}
+          </tbody>
+        </table>
+      </div>
+    `;
+
+    rowsHtml += `
+      <tr onclick="toggleRowExpansion('${rec.CUT}')" class="${highlightClass}" style="cursor: pointer; transition: background-color 0.15s;">
+        <td class="num-cell">
+          <span id="toggle-icon-${rec.CUT}" style="display:inline-block; transition: transform 0.2s; margin-right: 0.35rem; font-size: 0.65rem; color: var(--text-muted); transform: rotate(0deg);">▶</span>
+          ${rec.index}
+        </td>
+        <td class="cut-cell" style="font-weight: 700;">
+          ${rec.CUT}
+          ${dbBadge}
+        </td>
+        <td>${countBadge}</td>
+        <td style="white-space: nowrap;">${rec['Fecha de Creación de Tramite']}</td>
+        <td>${rec.Remitente}</td>
+        <td class="doc-cell" style="font-size:0.75rem;" title="${rec['Documento Origen']}">${rec['Documento Origen']}</td>
+        <td class="asunto-cell" title="${rec['Asunto Origen']}">${rec['Asunto Origen']}</td>
+        <td style="font-size:0.75rem; color:var(--text-muted);">-</td>
+        <td>${obsText}</td>
+        <td style="text-align:right;">
+          <button class="action-btn" onclick="toggleRowExpansion('${rec.CUT}'); event.stopPropagation();" style="padding: 0.25rem 0.5rem; font-size:0.7rem;">
+            Ver Info
+          </button>
+        </td>
+      </tr>
+      <tr class="detail-row" id="detail-row-${rec.CUT}" style="display: none; background: var(--bg-secondary);">
+        <td colspan="10" style="padding: 0.5rem 1rem;">
+          <div style="border-left: 3px solid var(--accent); padding-left: 0.75rem;">
+            ${subTableHtml}
+          </div>
+        </td>
+      </tr>
+    `;
+  });
+
+  panel.innerHTML = `
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem; flex-wrap:wrap; gap:0.5rem;">
+      <div style="font-size:0.85rem; color:var(--text-secondary);">
+        Coincidencias: <strong style="color:var(--accent);">${groupedRecords.length}</strong> expedientes únicos (${historicalFilteredRecords.length} registros en total)
+      </div>
+      <button class="btn-success" id="historical-export-btn" onclick="exportHistoricalHistoryAsCSV()" style="padding:0.35rem 0.75rem; font-size:0.7rem;" title="Exportar coincidencias históricas a CSV con sus observaciones">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:12px; height:12px;">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+          <polyline points="7 10 12 15 17 10"></polyline>
+          <line x1="12" y1="15" x2="12" y2="3"></line>
+        </svg>
+        Exportar Histórico
+      </button>
+    </div>
+
+    <div class="table-container">
+      <table class="data-table" id="historical-history-table">
+        <thead>
+          <tr>
+            <th class="sortable ${historicalSortCol === 'index' ? (historicalSortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-hist-col="index">N°</th>
+            <th class="sortable ${historicalSortCol === 'CUT' ? (historicalSortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-hist-col="CUT">CUT</th>
+            <th class="sortable ${historicalSortCol === 'count' ? (historicalSortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-hist-col="count">Registros</th>
+            <th class="sortable ${historicalSortCol === 'Fecha de Creación de Tramite' ? (historicalSortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-hist-col="Fecha de Creación de Tramite">Fecha de Creación de Trámite</th>
+            <th class="sortable ${historicalSortCol === 'Remitente' ? (historicalSortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-hist-col="Remitente">Remitente</th>
+            <th class="sortable ${historicalSortCol === 'Documento Origen' ? (historicalSortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-hist-col="Documento Origen">Documento Origen</th>
+            <th class="sortable ${historicalSortCol === 'Asunto Origen' ? (historicalSortDir === 'asc' ? 'sorted-asc' : 'sorted-desc') : ''}" data-hist-col="Asunto Origen">Asunto</th>
+            <th style="color:var(--text-muted);">Último Documento</th>
+            <th>Revisión</th>
+            <th style="text-align:right;">Acción</th>
+          </tr>
+        </thead>
+        <tbody id="historical-history-body">
+          ${rowsHtml}
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Pagination Controls -->
+    <div class="pagination-controls" id="historical-history-pagination">
+      <div class="pagination-left">
+        <span class="info" id="historical-history-pagination-info">Mostrando 0 - 0 de 0 registros</span>
+        <span style="color:var(--text-muted); font-size:0.8rem; margin:0 0.5rem;">|</span>
+        <label for="historical-history-page-size" style="font-size:0.8rem; color:var(--text-secondary);">Mostrar:</label>
+        <select class="page-size-select" id="historical-history-page-size">
+          <option value="20" ${historicalPageSize === 20 ? 'selected' : ''}>20</option>
+          <option value="50" ${historicalPageSize === 50 ? 'selected' : ''}>50</option>
+          <option value="100" ${historicalPageSize === 100 ? 'selected' : ''}>100</option>
+          <option value="300" ${historicalPageSize === 300 ? 'selected' : ''}>300</option>
+        </select>
+      </div>
+      <div class="pagination-buttons" id="historical-history-pagination-btns"></div>
+    </div>
+  `;
+
+  renderPaginationFooter({
+    containerId: 'historical-history-pagination',
+    infoId: 'historical-history-pagination-info',
+    btnsId: 'historical-history-pagination-btns',
+    totalRecords: groupedRecords.length,
+    currentPage: historicalCurrentPage,
+    pageSize: historicalPageSize,
+    onPageChange: (newPage) => {
+      historicalCurrentPage = newPage;
+      renderHistoricalHistory();
+    }
+  });
+
+  const headers = panel.querySelectorAll('#historical-history-table th.sortable');
+  headers.forEach(th => {
+    th.addEventListener('click', () => {
+      const colName = th.getAttribute('data-hist-col');
+      if (historicalSortCol === colName) {
+        historicalSortDir = historicalSortDir === 'asc' ? 'desc' : 'asc';
+      } else {
+        historicalSortCol = colName;
+        historicalSortDir = 'asc';
+      }
+      sortHistoricalMatches();
+      renderHistoricalHistory();
+    });
+  });
+
+  panel.querySelector('#historical-history-page-size').addEventListener('change', (e) => {
+    historicalPageSize = parseInt(e.target.value);
+    historicalCurrentPage = 1;
+    renderHistoricalHistory();
+  });
+}
+
+function exportHistoricalHistoryAsCSV() {
+  if (!selectedSenderId || historicalFilteredRecords.length === 0) {
+    alert('No hay coincidencias históricas para exportar.');
+    return;
+  }
+
+  const originalHeaders = historicalFilteredRecords[0]._original ? Object.keys(historicalFilteredRecords[0]._original) : [];
+  const headers = [...originalHeaders, 'Observación de Revisión'];
+
+  const escapeCsvValue = (val) => {
+    if (val === null || val === undefined) return '';
+    return '"' + val.toString().replace(/"/g, '""') + '"';
+  };
+
+  let csvRows = [headers.map(escapeCsvValue).join(';')];
+
+  historicalFilteredRecords.forEach(rec => {
+    if (rec._original) {
+      const obsText = observations[rec.CUT] || '';
+      const row = originalHeaders.map(h => rec._original[h] || '');
+      row.push(obsText);
+      csvRows.push(row.map(escapeCsvValue).join(';'));
+    }
+  });
+
+  const BOM = '\uFEFF';
+  const blob = new Blob([BOM + csvRows.join('\n')], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const dlAnchorElem = document.createElement('a');
+  dlAnchorElem.setAttribute("href", url);
+  
+  const searchInput = document.getElementById('search-sender');
+  const query = searchInput ? searchInput.value.trim() : '';
+  const nameToUse = query || selectedSenderId || 'export';
+  dlAnchorElem.setAttribute("download", `historico_${nameToUse.replace(/[^a-zA-Z0-9]/g, '_')}_sisged_ue002_${getFormattedDate()}.csv`);
+  dlAnchorElem.click();
+  
+  setTimeout(() => URL.revokeObjectURL(url), 100);
+}
+
 // Global hook for inline HTML calls (since module boundaries or bundling don't exist here)
 window.openRevisionModal = openRevisionModal;
 window.toggleDuplicateAccordion = toggleDuplicateAccordion;
 window.saveQuickObservation = saveQuickObservation;
 window.selectSender = selectSender;
 window.deleteObservationDirect = deleteObservationDirect;
+window.exportFilteredRecordsAsCSV = exportFilteredRecordsAsCSV;
+window.exportSenderHistoryAsCSV = exportSenderHistoryAsCSV;
+window.exportDuplicatesAsCSV = exportDuplicatesAsCSV;
+window.exportFilteredObservationsAsCSV = exportFilteredObservationsAsCSV;
+window.exportFilteredSendersAsCSV = exportFilteredSendersAsCSV;
+window.switchSenderTab = switchSenderTab;
+window.loadHistoricalDatabase = loadHistoricalDatabase;
+window.exportHistoricalHistoryAsCSV = exportHistoricalHistoryAsCSV;
+window.selectFilteredSendersGroup = selectFilteredSendersGroup;
+window.toggleRowExpansion = toggleRowExpansion;
